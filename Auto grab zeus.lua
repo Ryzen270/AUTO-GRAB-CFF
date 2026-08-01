@@ -1,457 +1,1062 @@
+_G.ScriptEnabled = true
+_G.CasingType = "Normal"
+_G.AutoWriteEnabled = false
+_G.AutoSubmitEnabled = false
 
-repeat task.wait() until game:IsLoaded()
+local enteredCodes = {}
+local activeConnections = {}
+
+local latestCode = nil
+local lastWrittenCode = nil
+local autoWriteConn = nil
+
+local pendingQueue = {}
+local pendingSeen = {}
+local writeBusy = false
+
+local collectedCodes = {}
+local collectedSeen = {}
+local CODE_SEPARATOR = ""
+
+_G.SubmitAfterCount = 1
+_G.SubmitAttempts = 10
+
+local ScreenGui = nil
+local MainFrame = nil
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
-local SoundService = game:GetService("SoundService")
-local Lighting = game:GetService("Lighting")
-local Player = Players.LocalPlayer
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
 
--- Configuration (FIXED VALUES)
-local Config = {
-    AutoSteal = true,
-    STEAL_RADIUS = 59,  -- FIXED
-    STEAL_DURATION = 1.3  -- FIXED
-}
-
--- Variables
-local isStealing = false
-local stealStartTime = nil
-local progressConnection = nil
-local StealData = {}
-local Connections = {}
-
--- GUI Elements
-local ProgressBarFill, ProgressLabel, ProgressPercentLabel
-local fpsLabel = nil
-local fpsUpdateConnection = nil
-
--- Discord style text for progress
-local DISCORD_TEXT = "Zeuss"
-
-local function getDiscordProgress(percent)
-    local totalChars = #DISCORD_TEXT
-    local adjustedPercent = math.min(percent * 1.5, 100)
-    local charsToShow = math.floor((adjustedPercent / 100) * totalChars)
-    if charsToShow == 0 and percent > 0 then charsToShow = 1 end
-    return string.sub(DISCORD_TEXT, 1, charsToShow)
+local function logStatus(message)
+    if MainFrame and MainFrame:FindFirstChild("StatusLabel") then
+        MainFrame.StatusLabel.Text = "Status: " .. message
+    end
 end
 
--- Check if plot belongs to player
-local function isMyPlotByName(pn)
-    local plots = workspace:FindFirstChild("Plots")
-    if not plots then return false end
-    local plot = plots:FindFirstChild(pn)
-    if not plot then return false end
-    local sign = plot:FindFirstChild("PlotSign")
-    if sign then
-        local yb = sign:FindFirstChild("YourBase")
-        if yb and yb:IsA("BillboardGui") then
-            return yb.Enabled == true
+local function isGuiVisible(obj)
+    if not obj or not obj.Visible then return false end
+    local current = obj.Parent
+    while current do
+        if current:IsA("GuiObject") and not current.Visible then
+            return false
+        elseif current:IsA("ScreenGui") and not current.Enabled then
+            return false
+        end
+        current = current.Parent
+    end
+    return true
+end
+
+local blacklistedWords = {
+    "top", "sec", "min", "fps", "ping", "loading",
+    "points", "coins", "cash", "rebirth", "slaps", "money",
+    "speed", "level", "lvl", "score"
+}
+
+local commonWords = {
+    ["the"]=true, ["and"]=true, ["for"]=true, ["you"]=true, ["your"]=true,
+    ["now"]=true, ["new"]=true, ["use"]=true, ["get"]=true, ["out"]=true,
+    ["all"]=true, ["are"]=true, ["can"]=true, ["with"]=true, ["from"]=true,
+    ["this"]=true, ["that"]=true, ["here"]=true, ["more"]=true, ["info"]=true,
+    ["redeem"]=true, ["claim"]=true,
+    ["enter"]=true, ["reward"]=true, ["rewards"]=true, ["update"]=true, ["join"]=true,
+    ["group"]=true, ["like"]=true, ["follow"]=true, ["sub"]=true, ["click"]=true,
+    ["type"]=true, ["copy"]=true, ["paste"]=true, ["server"]=true, ["event"]=true,
+    ["live"]=true, ["news"]=true, ["soon"]=true, ["available"]=true, ["expired"]=true,
+    ["welcome"]=true, ["thanks"]=true, ["thank"]=true, ["player"]=true, ["players"]=true,
+    ["today"]=true, ["time"]=true, ["wait"]=true, ["xp"]=true, ["money"]=true,
+    ["sammy"]=true, ["announcement"]=true, ["announcements"]=true, ["release"]=true,
+    ["released"]=true, ["limited"]=true, ["special"]=true, ["gift"]=true, ["pet"]=true,
+    ["pets"]=true, ["egg"]=true, ["luck"]=true, ["boost"]=true, ["double"]=true,
+    ["friend"]=true, ["friends"]=true, ["chat"]=true, ["online"]=true, ["offline"]=true,
+    ["invite"]=true, ["party"]=true, ["voice"]=true, ["report"]=true, ["block"]=true,
+    ["mute"]=true, ["store"]=true, ["shop"]=true, ["inventory"]=true, ["settings"]=true,
+    ["leaderboard"]=true, ["lobby"]=true, ["menu"]=true, ["close"]=true, ["open"]=true,
+    ["back"]=true, ["next"]=true, ["play"]=true, ["exit"]=true, ["loading"]=true,
+    ["negozio"]=true, ["rinascita"]=true, ["indice"]=true, ["duelli"]=true,
+    ["scambio"]=true, ["codici"]=true, ["incremento"]=true, ["amico"]=true,
+    ["drop"]=true, ["present"]=true,
+    ["win"]=true, ["wins"]=true, ["winner"]=true, ["winners"]=true, ["winning"]=true,
+    ["winter"]=true, ["victory"]=true, ["lose"]=true, ["loss"]=true, ["losses"]=true,
+    ["defeat"]=true, ["daily"]=true, ["spin"]=true, ["wheel"]=true, ["prize"]=true,
+    ["bonus"]=true, ["streak"]=true, ["rank"]=true, ["wave"]=true, ["round"]=true,
+    ["score"]=true, ["match"]=true, ["versus"]=true, ["battle"]=true, ["quest"]=true
+}
+
+local function isBlacklisted(lowerText)
+    if commonWords[lowerText] then return true end
+    for _, word in ipairs(blacklistedWords) do
+        if lowerText:find(word, 1, true) then
+            return true
         end
     end
     return false
 end
 
--- Find nearest steal prompt
-local function findNearestPrompt()
-    local char = Player.Character
-    local h = char and char:FindFirstChild("HumanoidRootPart")
-    if not h then return nil end
-    
-    local plots = workspace:FindFirstChild("Plots")
-    if not plots then return nil end
-    
-    local nearestPrompt, nearestDist, nearestName = nil, math.huge, nil
-    
-    for _, plot in ipairs(plots:GetChildren()) do
-        if isMyPlotByName(plot.Name) then
-            continue
+local function looksLikeCode(token)
+    if not token then return false end
+    if #token < 4 or #token > 20 then return false end
+    if not token:match("^%w+$") then return false end
+    if isBlacklisted(token:lower()) then return false end
+
+    local letterCount = 0
+    for _ in token:gmatch("%a") do letterCount = letterCount + 1 end
+    if letterCount < 3 then return false end
+    if token:match("^%d+[smhdSMHD]$") then return false end
+
+    local hasDigit = token:match("%d") ~= nil
+    local isAllUpper = (token == token:upper()) and (token:match("%a") ~= nil)
+    if not (hasDigit or isAllUpper) then return false end
+
+    return true
+end
+
+local function isLoneCode(text)
+    if not text then return false end
+    text = text:match("^%s*(.-)%s*$")
+    if text == "" or text:find("%s") then return false end
+    if #text < 3 or #text > 20 then return false end
+    if not text:match("^%w+$") then return false end
+    if isBlacklisted(text:lower()) then return false end
+    if text:match("^%d+[smhdSMHD]$") then return false end
+
+    if text:match("^%d+$") then
+        return #text >= 3
+    end
+
+    local letters = 0
+    for _ in text:gmatch("%a") do letters = letters + 1 end
+    return letters >= 2
+end
+
+local function extractCodesFromText(text)
+    local found = {}
+    if not text then return found end
+
+    local trimmed = text:match("^%s*(.-)%s*$")
+    -- Strip RichText tags if present
+    trimmed = trimmed:gsub("<[^>]->", "")
+
+    if isLoneCode(trimmed) then
+        table.insert(found, trimmed)
+        return found
+    end
+
+    for token in text:gmatch("%w+") do
+        if looksLikeCode(token) then
+            table.insert(found, token)
         end
-        
-        local podiums = plot:FindFirstChild("AnimalPodiums")
-        if not podiums then continue end
-        
-        for _, pod in ipairs(podiums:GetChildren()) do
-            pcall(function()
-                local base = pod:FindFirstChild("Base")
-                local spawn = base and base:FindFirstChild("Spawn")
-                if spawn then
-                    local dist = (spawn.Position - h.Position).Magnitude
-                    if dist < nearestDist and dist <= Config.STEAL_RADIUS then
-                        local att = spawn:FindFirstChild("PromptAttachment")
-                        if att then
-                            for _, ch in ipairs(att:GetChildren()) do
-                                if ch:IsA("ProximityPrompt") then
-                                    nearestPrompt, nearestDist, nearestName = ch, dist, pod.Name
-                                    break
-                                end
+    end
+    return found
+end
+
+local function copyCodeToClipboard(code)
+    local formattedCode = code
+    if _G.CasingType == "Upper" then
+        formattedCode = string.upper(code)
+    elseif _G.CasingType == "Lower" then
+        formattedCode = string.lower(code)
+    end
+
+    local success = false
+
+    if setclipboard then
+        pcall(function() setclipboard(formattedCode) end)
+        success = true
+    elseif toclipboard then
+        pcall(function() toclipboard(formattedCode) end)
+        success = true
+    elseif set_clipboard then
+        pcall(function() set_clipboard(formattedCode) end)
+        success = true
+    elseif Clipboard and Clipboard.set then
+        pcall(function() Clipboard.set(formattedCode) end)
+        success = true
+    end
+
+    if success then
+        logStatus("Copied: " .. formattedCode)
+    else
+        logStatus("Error: No clipboard support! " .. formattedCode)
+    end
+
+    return success
+end
+
+local function formatCode(code)
+    if _G.CasingType == "Upper" then
+        return string.upper(code)
+    elseif _G.CasingType == "Lower" then
+        return string.lower(code)
+    end
+    return code
+end
+
+-- Permanently cached TextBox — populated once and kept until removed
+local _cachedBox = nil
+
+local function _isCodeBox(obj)
+    if not obj:IsA("TextBox") then return false end
+    if ScreenGui and obj:IsDescendantOf(ScreenGui) then return false end
+    local hint = ((obj.PlaceholderText or "") .. " " .. obj.Name):lower()
+    return hint:find("code") or hint:find("redeem") or hint:find("here")
+end
+
+local function findCodeTextBox()
+    -- Fast path: cached box still valid
+    if _cachedBox and _cachedBox.Parent and isGuiVisible(_cachedBox) then
+        return _cachedBox
+    end
+    _cachedBox = nil
+    -- Fallback scan (only runs when cache is empty)
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then return nil end
+    for _, obj in ipairs(playerGui:GetDescendants()) do
+        if _isCodeBox(obj) then
+            if isGuiVisible(obj) then _cachedBox = obj return obj end
+        end
+    end
+    return nil
+end
+
+local function fireSignal(sig)
+    if not sig then return end
+    pcall(function()
+        if getconnections then
+            for _, c in ipairs(getconnections(sig)) do
+                if c.Fire then c:Fire() end
+            end
+        end
+    end)
+    if firesignal then
+        pcall(function() firesignal(sig) end)
+    end
+end
+
+local function isSubmitButton(obj)
+    if not (obj:IsA("TextButton") or obj:IsA("ImageButton")) then return false end
+    if ScreenGui and obj:IsDescendantOf(ScreenGui) then return false end
+    if not isGuiVisible(obj) then return false end
+    local hint = (((obj:IsA("TextButton") and obj.Text) or "") .. " " .. obj.Name):lower()
+    return hint:find("redeem") ~= nil or hint:find("submit") ~= nil
+end
+
+local function fireSubmitButton(nearObj)
+    local target = nil
+
+    local container = nearObj and nearObj.Parent or nil
+    local levels = 0
+    while container and not target and levels < 5 do
+        for _, obj in ipairs(container:GetDescendants()) do
+            if isSubmitButton(obj) then
+                target = obj
+                break
+            end
+        end
+        container = container.Parent
+        levels = levels + 1
+    end
+
+    if not target then return false end
+
+    fireSignal(target.MouseButton1Click)
+    fireSignal(target.Activated)
+    return true
+end
+
+-- ─── RF/RequestRedemption direct path ────────────────────────────────────────
+local _rfRemote = nil
+local function getRedemptionRF()
+    if _rfRemote and _rfRemote.Parent then return _rfRemote end
+    _rfRemote = nil
+
+    -- 1) Normal FindFirstChild (works if not hidden)
+    local rfFolder = ReplicatedStorage:FindFirstChild("RF")
+    if rfFolder then
+        local rf = rfFolder:FindFirstChild("RequestRedemption")
+        if rf and rf:IsA("RemoteFunction") then
+            _rfRemote = rf
+            return _rfRemote
+        end
+    end
+
+    -- 2) GetChildren() scan — catches hidden instances that FindFirstChild misses
+    if rfFolder then
+        for _, v in ipairs(rfFolder:GetChildren()) do
+            if v.Name == "RequestRedemption" and v:IsA("RemoteFunction") then
+                _rfRemote = v
+                return _rfRemote
+            end
+        end
+    end
+
+    -- 3) getinstances() — executor-level full instance list, finds truly hidden remotes
+    if getinstances then
+        for _, v in ipairs(getinstances()) do
+            if v.Name == "RequestRedemption" and v:IsA("RemoteFunction") then
+                _rfRemote = v
+                return _rfRemote
+            end
+        end
+    end
+
+    return _rfRemote
+end
+
+local function redeemViaRF(code)
+    local rf = getRedemptionRF()
+    if not rf then return false end
+    local formatted = formatCode(code)
+    local ok, result = pcall(function()
+        return rf:InvokeServer(formatted)
+    end)
+    if ok then
+        logStatus("Redeemed via RF: " .. formatted .. (result ~= nil and (" → " .. tostring(result)) or ""))
+        return true
+    else
+        logStatus("RF invoke failed: " .. tostring(result))
+        return false
+    end
+end
+-- ──────────────────────────────────────────────────────────────────────────────
+
+local function writeAndSubmit(code)
+    -- Try direct RemoteFunction path first
+    if redeemViaRF(code) then return true end
+
+    local textBox = findCodeTextBox()
+    if not textBox then
+        logStatus("Waiting for an open code box...")
+        return false
+    end
+
+    local formatted = formatCode(code)
+
+    pcall(function() textBox.ClearTextOnFocus = false end)
+
+    if not collectedSeen[formatted] then
+        collectedSeen[formatted] = true
+        table.insert(collectedCodes, formatted)
+    end
+    local fullText = table.concat(collectedCodes, CODE_SEPARATOR)
+    local target = math.max(1, tonumber(_G.SubmitAfterCount) or 1)
+    local ready = #collectedCodes >= target
+
+    if ready and _G.AutoSubmitEnabled then
+        local count = #collectedCodes
+        local btn = false
+        for i = 1, _G.SubmitAttempts do
+            local box = findCodeTextBox()
+            if not box then break end
+            local ok = pcall(function()
+                box:CaptureFocus()
+                box.Text = fullText
+                box.CursorPosition = #fullText + 1
+            end)
+            if not ok then
+                pcall(function() box.Text = fullText end)
+            end
+            pcall(function() box:ReleaseFocus(true) end)
+            if fireSubmitButton(box) then btn = true end
+        end
+        logStatus("Submitted " .. count .. " x" .. _G.SubmitAttempts
+            .. " (btn=" .. tostring(btn) .. "): " .. fullText)
+        table.clear(collectedCodes)
+        table.clear(collectedSeen)
+    else
+        local ok = pcall(function()
+            textBox:CaptureFocus()
+            textBox.Text = fullText
+            textBox.CursorPosition = #fullText + 1
+        end)
+        if not ok then
+            pcall(function() textBox.Text = fullText end)
+        end
+        if ready then
+            logStatus("Collected " .. #collectedCodes .. " codes (submit off): " .. fullText)
+            table.clear(collectedCodes)
+            table.clear(collectedSeen)
+        else
+            logStatus("Added: " .. formatted .. "  (" .. #collectedCodes .. "/" .. target .. ")")
+        end
+    end
+
+    return true
+end
+
+-- triggerWrite: fires instantly, no polling — called whenever a code is queued
+-- or the TextBox appears. Does nothing if already busy or nothing to do.
+local function triggerWrite()
+    if writeBusy or not _G.AutoWriteEnabled or #pendingQueue == 0 then return end
+    local focused = UserInputService:GetFocusedTextBox()
+    if focused and ScreenGui and focused:IsDescendantOf(ScreenGui) then return end
+    local box = findCodeTextBox()
+    if not (box and isGuiVisible(box)) then return end
+    writeBusy = true
+    task.spawn(function()
+        local ok, err = pcall(function()
+            while _G.AutoWriteEnabled and #pendingQueue > 0 do
+                local b = findCodeTextBox()
+                if not (b and isGuiVisible(b)) then break end
+                local code = table.remove(pendingQueue, 1)
+                pendingSeen[code] = nil
+                writeAndSubmit(code)
+            end
+        end)
+        writeBusy = false  -- ALWAYS reset, even if writeAndSubmit errored
+        if not ok then warn("[BrainrotCopier] triggerWrite error: " .. tostring(err)) end
+    end)
+end
+
+local function startAutoWriteLoop()
+    if autoWriteConn then return end
+    -- No polling loop — writes are triggered instantly from queue insertions.
+    -- We only need DescendantAdded to fire triggerWrite when the box first appears.
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 10)
+    local boxConn = playerGui and playerGui.DescendantAdded:Connect(function(obj)
+        if _isCodeBox(obj) and isGuiVisible(obj) then
+            _cachedBox = obj
+            triggerWrite()  -- box just appeared — drain queue immediately
+        end
+    end)
+    local boxRemConn = playerGui and playerGui.DescendantRemoving:Connect(function(obj)
+        if obj == _cachedBox then _cachedBox = nil end
+    end)
+    autoWriteConn = { Disconnect = function()
+        if boxConn then boxConn:Disconnect() end
+        if boxRemConn then boxRemConn:Disconnect() end
+    end }
+    table.insert(activeConnections, autoWriteConn)
+end
+
+-- Recursively extract strings from any value (handles string, table, mixed args)
+local function extractStrings(val, out)
+    out = out or {}
+    local t = type(val)
+    if t == "string" then
+        table.insert(out, val)
+    elseif t == "table" then
+        for _, v in pairs(val) do
+            extractStrings(v, out)
+        end
+    end
+    return out
+end
+
+local function processText(text)
+    if not text or text == "" then return end
+
+    local codes = extractCodesFromText(text)
+    if #codes == 0 then return end
+
+    for _, code in ipairs(codes) do
+        copyCodeToClipboard(code)
+        latestCode = code
+
+        if not pendingSeen[code] then
+            pendingSeen[code] = true
+            table.insert(pendingQueue, code)
+            triggerWrite()  -- instant — no polling needed
+        end
+
+        logStatus("Code detected: " .. code)
+    end
+end
+
+-- ─── PhiNotify remote resolver ───────────────────────────────────────────────
+-- Finds the obfuscated notification RemoteEvent by inspecting the connection
+-- graph of ReplicatedStorage.Packages.Net descendants.  The target is
+-- whichever RemoteEvent has a live OnClientEvent handler whose source
+-- references "NotificationController".  Falls back to a name-pattern match
+-- ("RE/<hex>") if debug APIs are unavailable.  Result is cached in
+-- _G.PhiNotifyRemote so subsequent calls are instant.
+local function resolveRemote()
+    if _G.PhiNotifyRemote then return _G.PhiNotifyRemote end
+
+    -- Wait for Packages.Net to exist
+    local Net
+    local deadline = tick() + 30
+    while not Net and tick() < deadline do
+        pcall(function()
+            local Pkgs = ReplicatedStorage:FindFirstChild("Packages")
+            if Pkgs then Net = Pkgs:FindFirstChild("Net") end
+        end)
+        if not Net then task.wait(0.5) end
+    end
+    if not Net then return nil end
+
+    local getinfo = debug and (debug.getinfo or debug.info)
+
+    -- Strategy 1: inspect connection function sources via getconnections
+    if getconnections and getinfo then
+        for _, d in ipairs(Net:GetDescendants()) do
+            if d:IsA("RemoteEvent") then
+                local ok, cs = pcall(getconnections, d.OnClientEvent)
+                if ok and cs then
+                    for _, c in ipairs(cs) do
+                        local f, fn = pcall(function() return c.Function end)
+                        if f and type(fn) == "function" then
+                            local i, info = pcall(getinfo, fn)
+                            if i and tostring(
+                                (type(info) == "table" and (info.short_src or info.source)) or info or ""
+                            ):find("NotificationController", 1, true) then
+                                _G.PhiNotifyRemote = d
+                                return d
                             end
                         end
                     end
                 end
-            end)
+            end
         end
     end
-    return nearestPrompt, nearestDist, nearestName
+
+    -- Strategy 2: name pattern match ("RE/<hex chars>")
+    for _, d in ipairs(Net:GetDescendants()) do
+        if d:IsA("RemoteEvent") and d.Name:match("^RE/%x+$") then
+            _G.PhiNotifyRemote = d
+            return d
+        end
+    end
+
+    return nil
 end
 
--- Reset progress bar UI
-local function ResetProgressBar()
-    if ProgressLabel then ProgressLabel.Text = "READY" end
-    if ProgressPercentLabel then ProgressPercentLabel.Text = "" end
-    if ProgressBarFill then ProgressBarFill.Size = UDim2.new(0, 0, 1, 0) end
-end
+local function startMonitoring()
+    task.spawn(function()
+        logStatus("Resolving PhiNotify remote...")
 
--- Execute steal
-local function executeSteal(prompt, name)
-    if isStealing then return end
-    
-    if not StealData[prompt] then
-        StealData[prompt] = {hold = {}, trigger = {}, ready = true}
-        pcall(function()
-            if getconnections then
-                for _, c in ipairs(getconnections(prompt.PromptButtonHoldBegan)) do
-                    if c.Function then table.insert(StealData[prompt].hold, c.Function) end
-                end
-                for _, c in ipairs(getconnections(prompt.Triggered)) do
-                    if c.Function then table.insert(StealData[prompt].trigger, c.Function) end
-                end
+        local NC = resolveRemote()
+
+        if not NC then
+            logStatus("PhiNotify remote not found — hook failed.")
+            return
+        end
+
+        local conn = NC.OnClientEvent:Connect(function(...)
+            if not _G.ScriptEnabled then return end
+            local strings = {}
+            for _, v in ipairs({...}) do
+                extractStrings(v, strings)
+            end
+            for _, s in ipairs(strings) do
+                processText(s)
             end
         end)
+
+        table.insert(activeConnections, conn)
+        logStatus("Hooked " .. NC.Name .. " — listening!")
+    end)
+end
+
+local function cleanupMonitoring()
+    for _, conn in pairs(activeConnections) do
+        if typeof(conn) == "RBXScriptConnection" then
+            conn:Disconnect()
+        end
     end
-    
-    local data = StealData[prompt]
-    if not data.ready then return end
-    
-    data.ready = false
-    isStealing = true
-    stealStartTime = tick()
-    
-    if ProgressLabel then ProgressLabel.Text = name or "STEALING..." end
-    
-    if progressConnection then progressConnection:Disconnect() end
-    progressConnection = RunService.Heartbeat:Connect(function()
-        if not isStealing then 
-            progressConnection:Disconnect() 
-            return 
-        end
-        local prog = math.clamp((tick() - stealStartTime) / Config.STEAL_DURATION, 0, 1)
-        if ProgressBarFill then 
-            ProgressBarFill.Size = UDim2.new(prog, 0, 1, 0) 
-        end
-        if ProgressPercentLabel then 
-            local percent = math.floor(prog * 100)
-            ProgressPercentLabel.Text = getDiscordProgress(percent)
-        end
-    end)
-    
-    task.spawn(function()
-        for _, f in ipairs(data.hold) do 
-            task.spawn(f) 
-        end
-        task.wait(Config.STEAL_DURATION)
-        for _, f in ipairs(data.trigger) do 
-            task.spawn(f) 
-        end
-        if progressConnection then progressConnection:Disconnect() end
-        ResetProgressBar()
-        data.ready = true
-        isStealing = false
-    end)
+    table.clear(activeConnections)
+    table.clear(enteredCodes)
+    table.clear(collectedCodes)
+    table.clear(collectedSeen)
+    table.clear(pendingQueue)
+    table.clear(pendingSeen)
+    writeBusy = false
+    autoWriteConn = nil
+    latestCode = nil
+    lastWrittenCode = nil
 end
 
--- Auto Steal loop
-local function startAutoSteal()
-    if Connections.autoSteal then return end
-    Connections.autoSteal = RunService.Heartbeat:Connect(function()
-        if not Config.AutoSteal or isStealing then return end
-        local prompt, _, name = findNearestPrompt()
-        if prompt then 
-            executeSteal(prompt, name) 
-        end
-    end)
-end
+local function createUI()
+    local oldGui = game:GetService("CoreGui"):FindFirstChild("BrainrotRedeemerGui")
+        or LocalPlayer.PlayerGui:FindFirstChild("BrainrotRedeemerGui")
+    if oldGui then oldGui:Destroy() end
 
-local function stopAutoSteal()
-    if Connections.autoSteal then
-        Connections.autoSteal:Disconnect()
-        Connections.autoSteal = nil
+    ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "BrainrotRedeemerGui"
+    ScreenGui.ResetOnSpawn = false
+
+    local successParent = pcall(function()
+        ScreenGui.Parent = game:GetService("CoreGui")
+    end)
+    if not successParent then
+        ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
     end
-    isStealing = false
-    ResetProgressBar()
-end
 
--- ============================================================
--- FPS COUNTER
--- ============================================================
-local function startFPS()
-    local frameCount = 0
-    local lastTime = tick()
-    
-    fpsUpdateConnection = RunService.RenderStepped:Connect(function()
-        frameCount = frameCount + 1
-        local currentTime = tick()
-        local delta = currentTime - lastTime
-        
-        if delta >= 0.5 then
-            local fps = math.floor(frameCount / delta)
-            frameCount = 0
-            lastTime = currentTime
-            
-            if fpsLabel then
-                local color = fps >= 60 and Color3.fromRGB(0, 255, 100) or (fps >= 30 and Color3.fromRGB(255, 200, 0) or Color3.fromRGB(255, 50, 50))
-                fpsLabel.Text = "FPS: " .. fps
-                fpsLabel.TextColor3 = color
+    MainFrame = Instance.new("Frame")
+    MainFrame.Name = "MainFrame"
+    MainFrame.Size = UDim2.new(0, 330, 0, 310)
+    MainFrame.Position = UDim2.new(0.5, -165, 0.4, -155)
+    MainFrame.BackgroundColor3 = Color3.fromRGB(12, 8, 18)
+    MainFrame.BorderSizePixel = 0
+    MainFrame.Active = true
+    MainFrame.Draggable = true
+    MainFrame.ClipsDescendants = true
+    MainFrame.Parent = ScreenGui
+
+    local FULL_HEIGHT = 310
+    local MINI_HEIGHT = 40
+
+    local mainCorner = Instance.new("UICorner")
+    mainCorner.CornerRadius = UDim.new(0, 12)
+    mainCorner.Parent = MainFrame
+
+    local mainStroke = Instance.new("UIStroke")
+    mainStroke.Color = Color3.fromRGB(150, 60, 255)
+    mainStroke.Thickness = 2
+    mainStroke.Parent = MainFrame
+
+    local strokeGradient = Instance.new("UIGradient")
+    strokeGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0.0, Color3.fromRGB(255, 0, 128)),
+        ColorSequenceKeypoint.new(0.33, Color3.fromRGB(140, 0, 255)),
+        ColorSequenceKeypoint.new(0.66, Color3.fromRGB(0, 200, 255)),
+        ColorSequenceKeypoint.new(1.0, Color3.fromRGB(255, 0, 128))
+    })
+    strokeGradient.Parent = mainStroke
+
+    local rgbConn = RunService.RenderStepped:Connect(function()
+        if not strokeGradient or not strokeGradient.Parent then return end
+        strokeGradient.Rotation = (tick() * 120) % 360
+    end)
+    table.insert(activeConnections, rgbConn)
+
+    local mainGradient = Instance.new("UIGradient")
+    mainGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(26, 12, 38)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(8, 6, 14))
+    })
+    mainGradient.Rotation = 45
+    mainGradient.Parent = MainFrame
+
+    local dragToggle = nil
+    local dragStart = nil
+    local startPos = nil
+
+    local function updateInput(input)
+        local delta = input.Position - dragStart
+        local position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        TweenService:Create(MainFrame, TweenInfo.new(0.08), {Position = position}):Play()
+    end
+
+    MainFrame.InputBegan:Connect(function(input)
+        if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+            dragToggle = true
+            dragStart = input.Position
+            startPos = MainFrame.Position
+            input.Changed:Connect(function()
+                if (input.UserInputState == Enum.UserInputState.End) then
+                    dragToggle = false
+                end
+            end)
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            if dragToggle then
+                updateInput(input)
             end
         end
     end)
-end
 
--- ============================================================
--- GUI - RED/BLACK STYLE (TOP RIGHT)
--- ============================================================
+    local AccentBar = Instance.new("Frame")
+    AccentBar.Name = "AccentBar"
+    AccentBar.Size = UDim2.new(0, 3, 0, 20)
+    AccentBar.Position = UDim2.new(0, 10, 0, 8)
+    AccentBar.BackgroundColor3 = Color3.fromRGB(155, 125, 255)
+    AccentBar.BorderSizePixel = 0
+    AccentBar.Parent = MainFrame
+    local AccentCorner = Instance.new("UICorner")
+    AccentCorner.CornerRadius = UDim.new(1, 0)
+    AccentCorner.Parent = AccentBar
 
-local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
-local guiScale = isMobile and 0.55 or 0.85
+    local HeaderLabel = Instance.new("TextLabel")
+    HeaderLabel.Name = "HeaderLabel"
+    HeaderLabel.Size = UDim2.new(1, -120, 0, 35)
+    HeaderLabel.Position = UDim2.new(0, 20, 0, 0)
+    HeaderLabel.BackgroundTransparency = 1
+    HeaderLabel.RichText = true
+    HeaderLabel.Text = '<b>Gamma<font color="#A65CFF"> Hub</font></b>'
+        .. '  <font color="#7C7C8C" size="11">Code Copier</font>'
+    HeaderLabel.TextColor3 = Color3.fromRGB(240, 240, 255)
+    HeaderLabel.TextSize = 16
+    HeaderLabel.Font = Enum.Font.GothamBold
+    HeaderLabel.TextXAlignment = Enum.TextXAlignment.Left
+    HeaderLabel.Parent = MainFrame
 
-local Colors = {
-    bg = Color3.fromRGB(4, 2, 2),
-    red = Color3.fromRGB(255, 40, 40),
-    redLight = Color3.fromRGB(255, 80, 80),
-    text = Color3.fromRGB(255, 255, 255),
-    textDim = Color3.fromRGB(200, 100, 100)
-}
+    local function makeHeaderButton(name, char, xOffset, hoverColor)
+        local btn = Instance.new("TextButton")
+        btn.Name = name
+        btn.Size = UDim2.new(0, 28, 0, 28)
+        btn.Position = UDim2.new(1, xOffset, 0, 4)
+        btn.BackgroundColor3 = Color3.fromRGB(28, 18, 42)
+        btn.AutoButtonColor = false
+        btn.Text = char
+        btn.TextColor3 = Color3.fromRGB(200, 190, 220)
+        btn.TextSize = 14
+        btn.Font = Enum.Font.GothamBold
+        btn.Parent = MainFrame
 
-local sg = Instance.new("ScreenGui")
-sg.Name = "ZeussHub"
-sg.ResetOnSpawn = false
-sg.Parent = Player.PlayerGui
-sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 6)
+        c.Parent = btn
 
-local function playClickSound()
-    pcall(function()
-        local s = Instance.new("Sound", SoundService)
-        s.SoundId = "rbxassetid://6895079813"
-        s.Volume = 0.25
-        s:Play()
-        game:GetService("Debris"):AddItem(s, 1)
+        local s = Instance.new("UIStroke")
+        s.Color = Color3.fromRGB(90, 50, 150)
+        s.Thickness = 1
+        s.Parent = btn
+
+        btn.MouseEnter:Connect(function()
+            btn.BackgroundColor3 = hoverColor
+            btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        end)
+        btn.MouseLeave:Connect(function()
+            btn.BackgroundColor3 = Color3.fromRGB(28, 18, 42)
+            btn.TextColor3 = Color3.fromRGB(200, 190, 220)
+        end)
+        return btn
+    end
+
+    local InstructionsButton = makeHeaderButton("InstructionsButton", "?", -101, Color3.fromRGB(120, 60, 200))
+    local MinimizeButton = makeHeaderButton("MinimizeButton", "–", -68, Color3.fromRGB(120, 60, 200))
+    local CloseButton = makeHeaderButton("CloseButton", "X", -35, Color3.fromRGB(200, 50, 60))
+
+    CloseButton.MouseButton1Click:Connect(function()
+        cleanupMonitoring()
+        ScreenGui:Destroy()
     end)
+
+    local minimized = false
+    MinimizeButton.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        local h = minimized and MINI_HEIGHT or FULL_HEIGHT
+        MinimizeButton.Text = minimized and "+" or "–"
+        TweenService:Create(MainFrame, TweenInfo.new(0.2),
+            {Size = UDim2.new(0, 330, 0, h)}):Play()
+    end)
+
+    local InstructionsFrame = Instance.new("Frame")
+    InstructionsFrame.Name = "InstructionsFrame"
+    InstructionsFrame.Size = UDim2.new(1, -20, 1, -45)
+    InstructionsFrame.Position = UDim2.new(0, 10, 0, 40)
+    InstructionsFrame.BackgroundColor3 = Color3.fromRGB(16, 10, 24)
+    InstructionsFrame.BorderSizePixel = 0
+    InstructionsFrame.Visible = false
+    InstructionsFrame.ZIndex = 5
+    InstructionsFrame.Parent = MainFrame
+
+    local infoCorner = Instance.new("UICorner")
+    infoCorner.CornerRadius = UDim.new(0, 8)
+    infoCorner.Parent = InstructionsFrame
+
+    local infoStroke = Instance.new("UIStroke")
+    infoStroke.Color = Color3.fromRGB(120, 60, 200)
+    infoStroke.Thickness = 1
+    infoStroke.Parent = InstructionsFrame
+
+    local InfoText = Instance.new("TextLabel")
+    InfoText.Size = UDim2.new(1, -20, 1, -20)
+    InfoText.Position = UDim2.new(0, 10, 0, 10)
+    InfoText.BackgroundTransparency = 1
+    InfoText.ZIndex = 6
+    InfoText.RichText = true
+    InfoText.TextWrapped = true
+    InfoText.TextXAlignment = Enum.TextXAlignment.Left
+    InfoText.TextYAlignment = Enum.TextYAlignment.Top
+    InfoText.TextColor3 = Color3.fromRGB(215, 205, 230)
+    InfoText.TextSize = 12
+    InfoText.Font = Enum.Font.Gotham
+    InfoText.Text = '<b><font color="#A65CFF">Gamma Hub — How to use</font></b>\n\n'
+        .. '• <b>Start / Stop</b>: turn code detection on or off.\n'
+        .. '• <b>Text Formatting</b>: how copied codes are cased.\n'
+        .. '• <b>Auto-Write</b>: types detected codes into the game\'s code box (must be open).\n'
+        .. '• <b>Auto-Submit</b>: presses Enter / clicks redeem.\n'
+        .. '• <b>Submit after (#)</b>: how many codes to collect before submitting.\n\n'
+        .. '<font color="#A65CFF">Detection source:</font> PhiNotify (RE/&lt;hex&gt; resolver)\n'
+        .. 'Codes fire directly from the server — no screen scanning needed.\n\n'
+        .. 'Detected codes are always copied to clipboard too.'
+    InfoText.Parent = InstructionsFrame
+
+    InstructionsButton.MouseButton1Click:Connect(function()
+        InstructionsFrame.Visible = not InstructionsFrame.Visible
+    end)
+
+    local Divider = Instance.new("Frame")
+    Divider.Size = UDim2.new(1, -20, 0, 1)
+    Divider.Position = UDim2.new(0, 10, 0, 35)
+    Divider.BackgroundColor3 = Color3.fromRGB(70, 60, 110)
+    Divider.BorderSizePixel = 0
+    Divider.Parent = MainFrame
+
+    local ToggleLabel = Instance.new("TextLabel")
+    ToggleLabel.Size = UDim2.new(0, 150, 0, 30)
+    ToggleLabel.Position = UDim2.new(0, 15, 0, 50)
+    ToggleLabel.BackgroundTransparency = 1
+    ToggleLabel.Text = "Monitoring Active:"
+    ToggleLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
+    ToggleLabel.TextSize = 13
+    ToggleLabel.Font = Enum.Font.GothamSemibold
+    ToggleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    ToggleLabel.Parent = MainFrame
+
+    local StartButton = Instance.new("TextButton")
+    StartButton.Name = "StartButton"
+    StartButton.Size = UDim2.new(0, 55, 0, 28)
+    StartButton.Position = UDim2.new(1, -132, 0, 51)
+    StartButton.Text = "Start"
+    StartButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    StartButton.TextSize = 11
+    StartButton.Font = Enum.Font.GothamBold
+    StartButton.Parent = MainFrame
+
+    local startCorner = Instance.new("UICorner")
+    startCorner.CornerRadius = UDim.new(0, 6)
+    startCorner.Parent = StartButton
+
+    local StopButton = Instance.new("TextButton")
+    StopButton.Name = "StopButton"
+    StopButton.Size = UDim2.new(0, 55, 0, 28)
+    StopButton.Position = UDim2.new(1, -70, 0, 51)
+    StopButton.Text = "Stop"
+    StopButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    StopButton.TextSize = 11
+    StopButton.Font = Enum.Font.GothamBold
+    StopButton.Parent = MainFrame
+
+    local stopCorner = Instance.new("UICorner")
+    stopCorner.CornerRadius = UDim.new(0, 6)
+    stopCorner.Parent = StopButton
+
+    local function renderStartStop()
+        if _G.ScriptEnabled then
+            StartButton.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
+            StopButton.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+        else
+            StartButton.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+            StopButton.BackgroundColor3 = Color3.fromRGB(231, 76, 60)
+        end
+    end
+    renderStartStop()
+
+    StartButton.MouseButton1Click:Connect(function()
+        _G.ScriptEnabled = true
+        renderStartStop()
+        logStatus("Detection started.")
+    end)
+
+    StopButton.MouseButton1Click:Connect(function()
+        _G.ScriptEnabled = false
+        renderStartStop()
+        logStatus("Detection stopped.")
+    end)
+
+    local CaseLabel = Instance.new("TextLabel")
+    CaseLabel.Size = UDim2.new(0, 150, 0, 30)
+    CaseLabel.Position = UDim2.new(0, 15, 0, 95)
+    CaseLabel.BackgroundTransparency = 1
+    CaseLabel.Text = "Text Formatting:"
+    CaseLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
+    CaseLabel.TextSize = 13
+    CaseLabel.Font = Enum.Font.GothamSemibold
+    CaseLabel.TextXAlignment = Enum.TextXAlignment.Left
+    CaseLabel.Parent = MainFrame
+
+    local ButtonContainer = Instance.new("Frame")
+    ButtonContainer.Size = UDim2.new(1, -30, 0, 32)
+    ButtonContainer.Position = UDim2.new(0, 15, 0, 125)
+    ButtonContainer.BackgroundTransparency = 1
+    ButtonContainer.Parent = MainFrame
+
+    local layout = Instance.new("UIListLayout")
+    layout.FillDirection = Enum.FillDirection.Horizontal
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 8)
+    layout.Parent = ButtonContainer
+
+    local optButtons = {}
+
+    local function updateCasingUI(selectedType)
+        _G.CasingType = selectedType
+        for casing, btn in pairs(optButtons) do
+            if casing == selectedType then
+                TweenService:Create(btn, TweenInfo.new(0.2), {
+                    BackgroundColor3 = Color3.fromRGB(114, 137, 218),
+                    TextColor3 = Color3.fromRGB(255, 255, 255)
+                }):Play()
+            else
+                TweenService:Create(btn, TweenInfo.new(0.2), {
+                    BackgroundColor3 = Color3.fromRGB(35, 35, 45),
+                    TextColor3 = Color3.fromRGB(160, 160, 170)
+                }):Play()
+            end
+        end
+        logStatus("Formatting changed to: " .. selectedType)
+    end
+
+    local casingOptions = {
+        {Type = "Normal", Label = "Normal"},
+        {Type = "Upper", Label = "UPPER"},
+        {Type = "Lower", Label = "lower"}
+    }
+
+    for i, opt in ipairs(casingOptions) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, 94, 1, 0)
+        btn.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+        btn.Text = opt.Label
+        btn.TextColor3 = Color3.fromRGB(160, 160, 170)
+        btn.TextSize = 11
+        btn.Font = Enum.Font.GothamBold
+        btn.Parent = ButtonContainer
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 6)
+        corner.Parent = btn
+
+        optButtons[opt.Type] = btn
+
+        btn.MouseButton1Click:Connect(function()
+            updateCasingUI(opt.Type)
+        end)
+    end
+
+    updateCasingUI("Normal")
+
+    local function createToggleRow(labelText, yPos, startOn, onChanged)
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(0, 200, 0, 30)
+        lbl.Position = UDim2.new(0, 15, 0, yPos)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = labelText
+        lbl.TextColor3 = Color3.fromRGB(200, 200, 210)
+        lbl.TextSize = 13
+        lbl.Font = Enum.Font.GothamSemibold
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Parent = MainFrame
+
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, 80, 0, 28)
+        btn.Position = UDim2.new(1, -95, 0, yPos + 1)
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.TextSize = 11
+        btn.Font = Enum.Font.GothamBold
+        btn.Parent = MainFrame
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 6)
+        corner.Parent = btn
+
+        local state = startOn
+        local function render()
+            if state then
+                btn.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
+                btn.Text = "ON"
+            else
+                btn.BackgroundColor3 = Color3.fromRGB(231, 76, 60)
+                btn.Text = "OFF"
+            end
+        end
+        render()
+
+        btn.MouseButton1Click:Connect(function()
+            state = not state
+            render()
+            onChanged(state)
+        end)
+        return btn
+    end
+
+    createToggleRow("Auto-Write:", 165, _G.AutoWriteEnabled, function(on)
+        _G.AutoWriteEnabled = on
+        if on then
+            logStatus("Auto-Write active (open the code box).")
+        else
+            table.clear(collectedCodes)
+            table.clear(collectedSeen)
+            table.clear(pendingQueue)
+            table.clear(pendingSeen)
+            lastWrittenCode = nil
+            logStatus("Auto-Write disabled (list cleared).")
+        end
+    end)
+
+    createToggleRow("Auto-Submit (Enter):", 200, _G.AutoSubmitEnabled, function(on)
+        _G.AutoSubmitEnabled = on
+        if on then
+            logStatus("Auto-Submit active.")
+        else
+            logStatus("Auto-Submit disabled.")
+        end
+    end)
+
+    local CountLabel = Instance.new("TextLabel")
+    CountLabel.Size = UDim2.new(0, 200, 0, 30)
+    CountLabel.Position = UDim2.new(0, 15, 0, 235)
+    CountLabel.BackgroundTransparency = 1
+    CountLabel.Text = "Submit after (#):"
+    CountLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
+    CountLabel.TextSize = 13
+    CountLabel.Font = Enum.Font.GothamSemibold
+    CountLabel.TextXAlignment = Enum.TextXAlignment.Left
+    CountLabel.Parent = MainFrame
+
+    local CountBox = Instance.new("TextBox")
+    CountBox.Name = "CountBox"
+    CountBox.Size = UDim2.new(0, 80, 0, 28)
+    CountBox.Position = UDim2.new(1, -95, 0, 236)
+    CountBox.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+    CountBox.Text = tostring(_G.SubmitAfterCount)
+    CountBox.PlaceholderText = "1"
+    CountBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    CountBox.TextSize = 12
+    CountBox.Font = Enum.Font.GothamBold
+    CountBox.ClearTextOnFocus = false
+    CountBox.Parent = MainFrame
+
+    local countCorner = Instance.new("UICorner")
+    countCorner.CornerRadius = UDim.new(0, 6)
+    countCorner.Parent = CountBox
+
+    CountBox.FocusLost:Connect(function()
+        local n = math.floor(tonumber(CountBox.Text) or 0)
+        if n < 1 then n = 1 end
+        _G.SubmitAfterCount = n
+        CountBox.Text = tostring(n)
+        logStatus("Will submit after " .. n .. " code(s). (" .. #collectedCodes .. " collected)")
+    end)
+
+    local StatusLabel = Instance.new("TextLabel")
+    StatusLabel.Name = "StatusLabel"
+    StatusLabel.Size = UDim2.new(1, -30, 0, 30)
+    StatusLabel.Position = UDim2.new(0, 15, 0, 268)
+    StatusLabel.BackgroundColor3 = Color3.fromRGB(12, 12, 15)
+    StatusLabel.Text = "Status: Script loaded. Waiting..."
+    StatusLabel.TextColor3 = Color3.fromRGB(170, 170, 185)
+    StatusLabel.TextSize = 11
+    StatusLabel.Font = Enum.Font.Gotham
+    StatusLabel.TextXAlignment = Enum.TextXAlignment.Center
+    StatusLabel.Parent = MainFrame
+
+    local statusCorner = Instance.new("UICorner")
+    statusCorner.CornerRadius = UDim.new(0, 6)
+    statusCorner.Parent = StatusLabel
+
+    local statusStroke = Instance.new("UIStroke")
+    statusStroke.Color = Color3.fromRGB(30, 30, 38)
+    statusStroke.Thickness = 1
+    statusStroke.Parent = StatusLabel
 end
 
--- Main Window - AGRANDI
-local main = Instance.new("Frame", sg)
-main.Size = UDim2.new(0, 280 * guiScale, 0, 130 * guiScale)
-main.Position = UDim2.new(1, -295 * guiScale, 0, 10 * guiScale)
-main.BackgroundColor3 = Colors.bg
-main.BorderSizePixel = 0
-main.Active = true
-main.Draggable = true
-main.ClipsDescendants = true
-Instance.new("UICorner", main).CornerRadius = UDim.new(0, 12 * guiScale)
+local function init()
+    pcall(cleanupMonitoring)
+    createUI()
+    startMonitoring()
+    startAutoWriteLoop()
+    logStatus("Initialization successful!")
+end
 
--- Border stroke
-local mainStroke = Instance.new("UIStroke", main)
-mainStroke.Thickness = 2
-local strokeGrad = Instance.new("UIGradient", mainStroke)
-strokeGrad.Color = ColorSequence.new({
-    ColorSequenceKeypoint.new(0, Colors.red),
-    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(80, 0, 0)),
-    ColorSequenceKeypoint.new(1, Colors.red)
-})
-
--- Animated border
-task.spawn(function()
-    local r = 0
-    while main.Parent do
-        r = (r + 1.5) % 360
-        strokeGrad.Rotation = r
-        task.wait(0.03)
-    end
-end)
-
--- Header with Title
-local header = Instance.new("Frame", main)
-header.Size = UDim2.new(1, 0, 0, 38 * guiScale)
-header.BackgroundTransparency = 1
-
-local titleLabel = Instance.new("TextLabel", header)
-titleLabel.Size = UDim2.new(0.65, 0, 1, 0)
-titleLabel.Position = UDim2.new(0, 12 * guiScale, 0, 0)
-titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "Zeuss HUB"
-titleLabel.TextColor3 = Colors.text
-titleLabel.Font = Enum.Font.GothamBlack
-titleLabel.TextSize = 14 * guiScale
-titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-
--- FPS Label in header
-fpsLabel = Instance.new("TextLabel", header)
-fpsLabel.Size = UDim2.new(0, 60 * guiScale, 1, 0)
-fpsLabel.Position = UDim2.new(0.65, 0, 0, 0)
-fpsLabel.BackgroundTransparency = 1
-fpsLabel.Text = "FPS: --"
-fpsLabel.TextColor3 = Colors.textDim
-fpsLabel.Font = Enum.Font.GothamBold
-fpsLabel.TextSize = 11 * guiScale
-fpsLabel.TextXAlignment = Enum.TextXAlignment.Right
-
--- Close button
-local closeBtn = Instance.new("TextButton", header)
-closeBtn.Size = UDim2.new(0, 26 * guiScale, 0, 26 * guiScale)
-closeBtn.Position = UDim2.new(1, -30 * guiScale, 0.5, -13 * guiScale)
-closeBtn.BackgroundTransparency = 1
-closeBtn.Text = "✕"
-closeBtn.TextColor3 = Colors.textDim
-closeBtn.Font = Enum.Font.GothamBold
-closeBtn.TextSize = 14 * guiScale
-closeBtn.MouseButton1Click:Connect(function() 
-    playClickSound()
-    sg:Destroy() 
-    if fpsUpdateConnection then fpsUpdateConnection:Disconnect() end
-end)
-closeBtn.MouseEnter:Connect(function() closeBtn.TextColor3 = Colors.red end)
-closeBtn.MouseLeave:Connect(function() closeBtn.TextColor3 = Colors.textDim end)
-
--- Separator line
-local separator = Instance.new("Frame", main)
-separator.Size = UDim2.new(0.9, 0, 0, 1)
-separator.Position = UDim2.new(0.05, 0, 0, 38 * guiScale)
-separator.BackgroundColor3 = Colors.red
-separator.BackgroundTransparency = 0.7
-separator.BorderSizePixel = 0
-
--- Toggle Row
-local toggleRow = Instance.new("Frame", main)
-toggleRow.Size = UDim2.new(1, -20 * guiScale, 0, 42 * guiScale)
-toggleRow.Position = UDim2.new(0, 10 * guiScale, 0, 46 * guiScale)
-toggleRow.BackgroundTransparency = 1
-
-local toggleLabel = Instance.new("TextLabel", toggleRow)
-toggleLabel.Size = UDim2.new(0.55, 0, 1, 0)
-toggleLabel.Position = UDim2.new(0, 8 * guiScale, 0, 0)
-toggleLabel.BackgroundTransparency = 1
-toggleLabel.Text = "AUTO STEAL"
-toggleLabel.TextColor3 = Colors.text
-toggleLabel.Font = Enum.Font.GothamBold
-toggleLabel.TextSize = 14 * guiScale
-toggleLabel.TextXAlignment = Enum.TextXAlignment.Left
-
-local toggleBg = Instance.new("Frame", toggleRow)
-toggleBg.Size = UDim2.new(0, 48 * guiScale, 0, 24 * guiScale)
-toggleBg.Position = UDim2.new(1, -56 * guiScale, 0.5, -12 * guiScale)
-toggleBg.BackgroundColor3 = Colors.red
-Instance.new("UICorner", toggleBg).CornerRadius = UDim.new(1, 0)
-
-local toggleCircle = Instance.new("Frame", toggleBg)
-toggleCircle.Size = UDim2.new(0, 19 * guiScale, 0, 19 * guiScale)
-toggleCircle.Position = UDim2.new(1, -21 * guiScale, 0.5, -9.5 * guiScale)
-toggleCircle.BackgroundColor3 = Color3.new(1, 1, 1)
-Instance.new("UICorner", toggleCircle).CornerRadius = UDim.new(1, 0)
-
-local toggleBtn = Instance.new("TextButton", toggleRow)
-toggleBtn.Size = UDim2.new(1, 0, 1, 0)
-toggleBtn.BackgroundTransparency = 1
-toggleBtn.Text = ""
-
-local autoStealOn = true
-
-toggleBtn.MouseButton1Click:Connect(function()
-    playClickSound()
-    autoStealOn = not autoStealOn
-    Config.AutoSteal = autoStealOn
-    TweenService:Create(toggleBg, TweenInfo.new(0.2), {
-        BackgroundColor3 = autoStealOn and Colors.red or Color3.fromRGB(30, 20, 35)
-    }):Play()
-    TweenService:Create(toggleCircle, TweenInfo.new(0.2, Enum.EasingStyle.Back), {
-        Position = autoStealOn and UDim2.new(1, -21 * guiScale, 0.5, -9.5 * guiScale) or UDim2.new(0, 3 * guiScale, 0.5, -9.5 * guiScale)
-    }):Play()
-    
-    if autoStealOn then
-        startAutoSteal()
-    else
-        stopAutoSteal()
-    end
-end)
-
--- Info row (radius & duration)
-local infoRow = Instance.new("Frame", main)
-infoRow.Size = UDim2.new(1, -20 * guiScale, 0, 28 * guiScale)
-infoRow.Position = UDim2.new(0, 10 * guiScale, 0, 94 * guiScale)
-infoRow.BackgroundTransparency = 1
-
-local infoLabel = Instance.new("TextLabel", infoRow)
-infoLabel.Size = UDim2.new(1, 0, 1, 0)
-infoLabel.BackgroundTransparency = 1
-infoLabel.Text = "STEAL RADIUS: 59  |  DURATION: 1.3s"
-infoLabel.TextColor3 = Colors.redLight
-infoLabel.Font = Enum.Font.GothamBold
-infoLabel.TextSize = 11 * guiScale
-infoLabel.TextXAlignment = Enum.TextXAlignment.Center
-
--- ============================================================
--- PROGRESS BAR (Bottom Center)
--- ============================================================
-
-local progressContainer = Instance.new("Frame", sg)
-progressContainer.Size = UDim2.new(0, 380 * guiScale, 0, 52 * guiScale)
-progressContainer.Position = UDim2.new(0.5, -190 * guiScale, 1, -65 * guiScale)
-progressContainer.BackgroundColor3 = Color3.fromRGB(2, 2, 4)
-progressContainer.ClipsDescendants = true
-Instance.new("UICorner", progressContainer).CornerRadius = UDim.new(0, 10 * guiScale)
-
-local progStroke = Instance.new("UIStroke", progressContainer)
-progStroke.Thickness = 1.5
-progStroke.Color = Colors.red
-
-ProgressLabel = Instance.new("TextLabel", progressContainer)
-ProgressLabel.Size = UDim2.new(0.35, 0, 0.5, 0)
-ProgressLabel.Position = UDim2.new(0, 12 * guiScale, 0, 0)
-ProgressLabel.BackgroundTransparency = 1
-ProgressLabel.Text = "READY"
-ProgressLabel.TextColor3 = Colors.text
-ProgressLabel.Font = Enum.Font.GothamBold
-ProgressLabel.TextSize = 12 * guiScale
-ProgressLabel.TextXAlignment = Enum.TextXAlignment.Left
-
-ProgressPercentLabel = Instance.new("TextLabel", progressContainer)
-ProgressPercentLabel.Size = UDim2.new(0.6, 0, 0.5, 0)
-ProgressPercentLabel.Position = UDim2.new(0.35, 0, 0, 0)
-ProgressPercentLabel.BackgroundTransparency = 1
-ProgressPercentLabel.Text = ""
-ProgressPercentLabel.TextColor3 = Colors.redLight
-ProgressPercentLabel.Font = Enum.Font.GothamBlack
-ProgressPercentLabel.TextSize = 14 * guiScale
-ProgressPercentLabel.TextXAlignment = Enum.TextXAlignment.Center
-
-local progTrack = Instance.new("Frame", progressContainer)
-progTrack.Size = UDim2.new(0.96, 0, 0, 6 * guiScale)
-progTrack.Position = UDim2.new(0.02, 0, 1, -12 * guiScale)
-progTrack.BackgroundColor3 = Color3.fromRGB(8, 5, 10)
-Instance.new("UICorner", progTrack).CornerRadius = UDim.new(1, 0)
-
-ProgressBarFill = Instance.new("Frame", progTrack)
-ProgressBarFill.Size = UDim2.new(0, 0, 1, 0)
-ProgressBarFill.BackgroundColor3 = Colors.red
-Instance.new("UICorner", ProgressBarFill).CornerRadius = UDim.new(1, 0)
-
--- Small close for progress bar
-local progClose = Instance.new("TextButton", progressContainer)
-progClose.Size = UDim2.new(0, 22 * guiScale, 0, 22 * guiScale)
-progClose.Position = UDim2.new(1, -28 * guiScale, 0.5, -11 * guiScale)
-progClose.BackgroundTransparency = 1
-progClose.Text = "✕"
-progClose.TextColor3 = Colors.textDim
-progClose.Font = Enum.Font.GothamBold
-progClose.TextSize = 12 * guiScale
-progClose.MouseButton1Click:Connect(function() 
-    playClickSound()
-    sg:Destroy()
-    if fpsUpdateConnection then fpsUpdateConnection:Disconnect() end
-end)
-
--- Initialize
-startFPS()
-startAutoSteal()startAutoSteal()
+init()
